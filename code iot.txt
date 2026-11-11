@@ -1,0 +1,405 @@
+
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <SPI.h>
+#include <MFRC522.h>
+#include <ESP32Servo.h>
+#include <ArduinoJson.h>
+
+// ---------- WIFI ----------
+const char* WIFI_SSID = "ROXTAR 5G";
+const char* WIFI_PASSWORD = "";
+
+// ---------- FIREBASE ----------
+const char* FIREBASE_API_KEY =
+  "AIzaSyB21U5tp2E6PcNWH6onaDEfRDE2PEAg2Z0";
+
+const char* FIREBASE_DB_URL =
+  "https://iot-smart-asset-locker-default-rtdb.firebaseio.com";
+
+const char* DEVICE_EMAIL = "locker@gmail.com";
+const char* DEVICE_PASSWORD = "locker@12345";
+
+// ---------- PINS ----------
+#define RFID_SS    5
+#define RFID_RST   22
+#define RFID_SCK   18
+#define RFID_MISO  19
+#define RFID_MOSI  23
+
+#define SERVO_PIN  21
+#define RED_LED    16
+#define GREEN_LED  17
+
+// Change to false if servo has no proper 5V supply.
+const bool ENABLE_SERVO = true;
+
+const int LOCK_ANGLE = 0;
+const int UNLOCK_ANGLE = 90;
+
+MFRC522 rfid(RFID_SS, RFID_RST);
+Servo lockerServo;
+
+String firebaseToken = "";
+String lockerState = "locked";
+String activeCard = "";
+String authorizedCard = "";
+String pendingId = "";
+
+unsigned long lastPoll = 0;
+unsigned long lastScan = 0;
+unsigned long loginMillis = 0;
+unsigned long requestCounter = 0;
+
+const unsigned long POLL_INTERVAL = 1500;
+const unsigned long SCAN_COOLDOWN = 2000;
+
+// ---------- HTTP ----------
+bool httpRequest(
+  const String &url,
+  const String &method,
+  const String &body,
+  String &response
+) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  WiFiClientSecure client;
+  client.setInsecure(); // Demo only; TLS not verified
+
+  HTTPClient http;
+  http.setTimeout(8000);
+
+  if (!http.begin(client, url)) return false;
+
+  http.addHeader("Content-Type", "application/json");
+
+  int status = -1;
+
+  if (method == "GET") {
+    status = http.GET();
+  } else if (method == "POST") {
+    status = http.POST(body);
+  } else if (method == "PATCH") {
+    status = http.sendRequest("PATCH", body);
+  }
+
+  response = http.getString();
+  http.end();
+
+  if (status < 200 || status >= 300) {
+    Serial.print("HTTP Error: ");
+    Serial.println(status);
+    Serial.println(response);
+    return false;
+  }
+
+  return true;
+}
+
+// ---------- FIREBASE LOGIN ----------
+bool firebaseLogin() {
+  JsonDocument request;
+  request["email"] = DEVICE_EMAIL;
+  request["password"] = DEVICE_PASSWORD;
+  request["returnSecureToken"] = true;
+
+  String body;
+  serializeJson(request, body);
+
+  String url =
+    String("https://identitytoolkit.googleapis.com/v1/") +
+    "accounts:signInWithPassword?key=" +
+    FIREBASE_API_KEY;
+
+  String response;
+
+  if (!httpRequest(url, "POST", body, response))
+    return false;
+
+  JsonDocument result;
+
+  if (deserializeJson(result, response))
+    return false;
+
+  firebaseToken = result["idToken"].as<String>();
+
+  if (firebaseToken.isEmpty())
+    return false;
+
+  loginMillis = millis();
+  Serial.println("Firebase connected!");
+  return true;
+}
+
+// ---------- DATABASE ----------
+String lockerURL() {
+  return String(FIREBASE_DB_URL) +
+    "/locker1.json?auth=" + firebaseToken;
+}
+
+bool readLocker(JsonDocument &doc) {
+  if (firebaseToken.isEmpty()) return false;
+
+  String response;
+
+  if (!httpRequest(lockerURL(), "GET", "", response))
+    return false;
+
+  return !deserializeJson(doc, response);
+}
+
+bool updateLocker(JsonDocument &doc) {
+  if (firebaseToken.isEmpty()) return false;
+
+  String body, response;
+  serializeJson(doc, body);
+
+  return httpRequest(
+    lockerURL(), "PATCH", body, response
+  );
+}
+
+// ---------- LOCK / UNLOCK ----------
+void lockLocker() {
+  if (ENABLE_SERVO) {
+    lockerServo.write(LOCK_ANGLE);
+  }
+
+  digitalWrite(RED_LED, HIGH);
+  digitalWrite(GREEN_LED, LOW);
+
+  lockerState = "locked";
+  Serial.println("LOCKED - RED LED ON");
+}
+
+void unlockLocker() {
+  if (ENABLE_SERVO) {
+    lockerServo.write(UNLOCK_ANGLE);
+  }
+
+  digitalWrite(RED_LED, LOW);
+  digitalWrite(GREEN_LED, HIGH);
+
+  lockerState = "unlocked";
+  Serial.println("UNLOCKED - GREEN LED ON");
+}
+
+// ---------- RFID ----------
+String readRFID() {
+  if (!rfid.PICC_IsNewCardPresent())
+    return "";
+
+  if (!rfid.PICC_ReadCardSerial())
+    return "";
+
+  String uid = "";
+
+  for (byte i = 0; i < rfid.uid.size; i++) {
+    if (rfid.uid.uidByte[i] < 16)
+      uid += "0";
+
+    uid += String(rfid.uid.uidByte[i], HEX);
+  }
+
+  uid.toUpperCase();
+
+  rfid.PICC_HaltA();
+  rfid.PCD_StopCrypto1();
+
+  return uid;
+}
+
+// ---------- APPROVAL REQUEST ----------
+void sendApprovalRequest(String uid) {
+  requestCounter++;
+
+  String requestId =
+    String(millis()) + "-" +
+    String(requestCounter) + "-" + uid;
+
+  JsonDocument data;
+  data["state"] = "pending";
+  data["cardUid"] = uid;
+  data["requestId"] = requestId;
+  data["decisionId"] = "";
+
+  if (updateLocker(data)) {
+    activeCard = uid;
+    pendingId = requestId;
+    lockerState = "pending";
+
+    Serial.println("Approval request sent!");
+  } else {
+    Serial.println("Approval request failed");
+  }
+}
+
+// ---------- CARD HANDLING ----------
+void handleRFID(String uid) {
+  Serial.print("RFID UID: ");
+  Serial.println(uid);
+
+  if (lockerState == "pending") {
+    Serial.println("Waiting for admin");
+    return;
+  }
+
+  if (lockerState == "locked") {
+    sendApprovalRequest(uid);
+    return;
+  }
+
+  if (lockerState == "unlocked") {
+    if (uid != authorizedCard) {
+      Serial.println("Wrong card!");
+      return;
+    }
+
+    // Close door manually before scanning.
+    JsonDocument data;
+    data["state"] = "locked";
+
+    if (updateLocker(data)) {
+      lockLocker();
+      activeCard = "";
+      pendingId = "";
+    }
+  }
+}
+
+// ---------- ADMIN DECISION ----------
+void checkAdminApproval() {
+  if (lockerState != "pending") return;
+
+  JsonDocument data;
+
+  if (!readLocker(data)) return;
+
+  String cloudState = data["state"] | "";
+  String requestId = data["requestId"].as<String>();
+  String decisionId = data["decisionId"].as<String>();
+  String cardUid = data["cardUid"] | "";
+
+  if (requestId != pendingId ||
+      cardUid != activeCard) return;
+
+  if (cloudState == "approved" &&
+      decisionId == pendingId) {
+
+    JsonDocument update;
+    update["state"] = "unlocked";
+
+    if (updateLocker(update)) {
+      authorizedCard = activeCard;
+      unlockLocker();
+      Serial.println("ADMIN APPROVED");
+    }
+  } else if (cloudState == "rejected" &&
+             decisionId == pendingId) {
+
+    JsonDocument update;
+    update["state"] = "locked";
+
+    if (updateLocker(update)) {
+      lockLocker();
+      activeCard = "";
+      pendingId = "";
+      Serial.println("ADMIN REJECTED");
+    }
+  }
+}
+
+// ---------- WIFI ----------
+void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID);
+
+  Serial.print("Connecting WiFi");
+
+  unsigned long started = millis();
+
+  while (WiFi.status() != WL_CONNECTED &&
+         millis() - started < 20000) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("WiFi connected!");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("WiFi connection failed");
+  }
+}
+
+// ---------- SETUP ----------
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  pinMode(RED_LED, OUTPUT);
+  pinMode(GREEN_LED, OUTPUT);
+
+  if (ENABLE_SERVO) {
+    lockerServo.setPeriodHertz(50);
+    lockerServo.attach(SERVO_PIN, 500, 2400);
+  }
+
+  lockLocker();
+
+  SPI.begin(
+    RFID_SCK, RFID_MISO,
+    RFID_MOSI, RFID_SS
+  );
+
+  rfid.PCD_Init();
+  Serial.println("RFID initialized");
+
+  connectWiFi();
+
+  if (WiFi.status() == WL_CONNECTED &&
+      firebaseLogin()) {
+
+    JsonDocument reset;
+    reset["state"] = "locked";
+    reset["decisionId"] = "";
+    updateLocker(reset);
+  }
+
+  Serial.println("SMART ASSET LOCKER READY");
+}
+
+// ---------- LOOP ----------
+void loop() {
+  if (WiFi.status() != WL_CONNECTED) {
+    connectWiFi();
+    delay(1000);
+    return;
+  }
+
+  if (firebaseToken.isEmpty() ||
+      millis() - loginMillis > 2700000UL) {
+    if (!firebaseLogin()) {
+      delay(3000);
+      return;
+    }
+  }
+
+  String uid = readRFID();
+
+  if (uid.length() > 0 &&
+      millis() - lastScan > SCAN_COOLDOWN) {
+    handleRFID(uid);
+    lastScan = millis();
+  }
+
+  if (millis() - lastPoll > POLL_INTERVAL) {
+    checkAdminApproval();
+    lastPoll = millis();
+  }
+
+  delay(30);
+}
